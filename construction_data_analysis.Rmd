@@ -1,0 +1,364 @@
+---
+title: "New Residential Construction Time Series Analysis"
+author: "Tymoteusz Pawełczyk"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    number_sections: no
+    theme: cosmo
+  pdf_document:
+    toc: yes
+    number_sections: no
+---
+
+## 1. Executive Summary
+
+This report evaluates monthly residential construction starts using a compact and reproducible time-series workflow.
+The model comparison includes Holt-Winters variants and baseline methods (Naive and Seasonal Naive). Detailed backtest evidence and forecast-quality assessment are presented in the Forecast Error Evaluation and Forecast Comparison subsections.
+
+## 2. Analysis Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 11,
+  fig.height = 5.5
+)
+```
+
+```{r run-analysis}
+# Run the production script in an isolated environment and reuse all generated objects.
+analysis_env <- new.env(parent = globalenv())
+invisible(capture.output(sys.source("construction_data_analysis.R", envir = analysis_env)))
+
+champion_model <- analysis_env$champion_model_key
+all_metrics <- analysis_env$metrics_table
+
+test_metrics <- subset(all_metrics, dataset == "test")
+test_metrics <- test_metrics[order(test_metrics$MAE), ]
+
+train_metrics <- subset(all_metrics, dataset == "train")
+train_metrics <- train_metrics[order(train_metrics$MAE), ]
+
+hw_train_metrics <- subset(train_metrics, model_family == "holt_winters")
+hw_test_metrics <- subset(test_metrics, model_family == "holt_winters")
+
+diagnostics_table <- analysis_env$diagnostics_table
+forward_forecast <- analysis_env$forward_forecast_table
+
+decomposition_fit <- stats::stl(analysis_env$full_ts, s.window = "periodic")
+decomposition_df <- data.frame(
+  date = analysis_env$construction_df$date,
+  observed = as.numeric(analysis_env$full_ts),
+  trend = as.numeric(decomposition_fit$time.series[, "trend"]),
+  seasonal = as.numeric(decomposition_fit$time.series[, "seasonal"]),
+  irregular = as.numeric(decomposition_fit$time.series[, "remainder"])
+)
+
+decomposition_components <- rbind(
+  data.frame(date = decomposition_df$date, component = "Seasonal", value = decomposition_df$seasonal),
+  data.frame(date = decomposition_df$date, component = "Irregular", value = decomposition_df$irregular)
+)
+
+hw_backtest_data <- subset(
+  analysis_env$backtest_plot_data,
+  series %in% c(
+    "Actual",
+    "HW Additive (Auto)",
+    "HW Additive (Fixed)",
+    "HW Multiplicative (Auto)",
+    "HW Multiplicative (Fixed)"
+  )
+)
+
+hw_backtest_data$series <- factor(
+  hw_backtest_data$series,
+  levels = c(
+    "Actual",
+    "HW Additive (Auto)",
+    "HW Additive (Fixed)",
+    "HW Multiplicative (Auto)",
+    "HW Multiplicative (Fixed)"
+  )
+)
+```
+
+## 3. Seasonal Time Series
+
+### Data Description
+
+The dataset used in this section describes the **number of newly started residential construction projects in the United States**, expressed in **thousands of housing units**.
+
+The observations are recorded at a **monthly frequency** and are **not seasonally adjusted**. The data originate from the official statistical database of the **United States Census Bureau**, which publishes long-term indicators related to construction activity in the U.S. housing market.
+
+The dataset contains **475 observations**, beginning in **August 1985** and ending in **February 2025**. The relatively long observation window allows both long-term cyclical dynamics and short-term seasonal fluctuations in construction activity to be examined.
+
+Residential construction activity is known to be influenced by macroeconomic conditions, housing demand, financing conditions, and seasonal factors related to weather and construction logistics. As a result, the series provides a suitable example of an economic time series exhibiting both **seasonal and cyclical components**.
+
+Before model estimation, the production workflow applies practical quality controls, including timestamp parsing checks, missing-value validation, duplicate-period detection, monthly continuity verification, and positivity checks required by multiplicative seasonal specifications.
+
+---
+
+### Time Series Decomposition
+
+Visual inspection of the time series indicates the presence of both **seasonal and cyclical patterns**. Regular annual fluctuations can be clearly observed, indicating a strong seasonal component in residential construction activity.
+
+This seasonal pattern is consistent with the **annual cycle of construction activity**, which tends to intensify during warmer months when weather conditions allow for more intensive building work. Conversely, construction activity typically declines during colder months.
+
+The decomposition results, obtained with an **STL decomposition** (Seasonal-Trend decomposition using Loess), illustrate these structural components of the series. In particular, the smoothed trend component (represented by the yellow line in the decomposition plot) highlights the **cyclical behaviour of the housing construction market**. Periods of expansion and contraction correspond to broader macroeconomic and housing market cycles.
+
+Such cyclical movements reflect changes in housing demand, credit conditions, and economic growth, which significantly influence investment in residential construction.
+
+```{r decomposition-trend-plot, fig.height=5, fig.cap="Figure 1. Observed residential construction starts and smoothed cyclical trend (STL)."}
+decomposition_overlay <- rbind(
+  data.frame(
+    date = decomposition_df$date,
+    series = "Smoothed cyclical trend (STL trend)",
+    value = decomposition_df$trend
+  ),
+  data.frame(
+    date = decomposition_df$date,
+    series = "Observed construction starts",
+    value = decomposition_df$observed
+  )
+)
+
+decomposition_overlay$series <- factor(
+  decomposition_overlay$series,
+  levels = c(
+    "Smoothed cyclical trend (STL trend)",
+    "Observed construction starts"
+  )
+)
+
+ggplot2::ggplot(
+  decomposition_overlay,
+  ggplot2::aes(x = date, y = value, color = series)
+) +
+  ggplot2::geom_line(linewidth = 0.95) +
+  ggplot2::scale_color_manual(
+    values = c(
+      "Smoothed cyclical trend (STL trend)" = "#F1C40F",
+      "Observed construction starts" = "#FF1F1F"
+    )
+  ) +
+  ggplot2::scale_x_date(date_labels = "%b %Y", date_breaks = "5 years") +
+  ggplot2::labs(
+    title = "Residential construction starts",
+    x = NULL,
+    y = "Thousand units",
+    color = NULL
+  ) +
+  ggplot2::theme_classic(base_size = 12) +
+  ggplot2::theme(
+    legend.position = "top",
+    legend.justification = "left",
+    legend.box.just = "left",
+    plot.title = ggplot2::element_text(face = "bold")
+  )
+```
+
+```{r decomposition-components-plot, fig.height=5, fig.cap="Figure 2. Seasonal and irregular components from STL decomposition."}
+ggplot2::ggplot(
+  decomposition_components,
+  ggplot2::aes(x = date, y = value)
+) +
+  ggplot2::geom_line(color = "#2A9D8F", linewidth = 0.55) +
+  ggplot2::facet_wrap(~component, ncol = 1, scales = "free_y") +
+  ggplot2::labs(
+    title = "Seasonal and Irregular Components",
+    x = "Date",
+    y = "Component value"
+  ) +
+  ggplot2::theme_minimal(base_size = 12)
+```
+
+---
+
+### Exploratory Seasonal Models
+
+In order to evaluate both the **goodness of fit** and the **forecasting performance** of seasonal time-series models, classical exponential smoothing models with seasonality were applied using the **Holt-Winters method**.
+
+Two types of seasonal models were considered:
+
+- **Additive Holt-Winters models**
+- **Multiplicative Holt-Winters models**
+
+Each specification was estimated in two versions:
+
+1. A version with **manually selected smoothing parameters**
+2. A version with **automatically estimated parameters**
+
+The smoothing parameters included:
+
+- **alpha** - level smoothing parameter
+- **beta** - trend smoothing parameter
+- **gamma** - seasonal smoothing parameter
+
+To evaluate predictive performance, the **12 most recent observations** were separated from the dataset and used as an **out-of-sample test set**. The remaining observations were used as the **training dataset** for model estimation.
+
+Two types of model performance were therefore examined:
+
+- **In-sample fit errors**, measuring how well the models reproduce the training data
+- **Out-of-sample forecast errors**, measuring how accurately the models predict unseen observations
+
+---
+
+### Model Fit Evaluation
+
+The results of the in-sample fit evaluation are presented in **Table 1**, which reports the forecast accuracy metrics for additive and multiplicative Holt-Winters models.
+
+Model performance was evaluated using the following error measures:
+
+- Mean Absolute Error (MAE)
+- Mean Squared Error (MSE)
+- Mean Absolute Percentage Error (MAPE)
+- Adjusted Mean Absolute Percentage Error (AMAPE)
+
+Among the models estimated on the training data, the **multiplicative Holt-Winters model with automatically estimated parameters** achieved the **lowest values for all error metrics**, indicating the best fit to the historical observations.
+
+This result suggests that the multiplicative formulation captures the relationship between the level of the series and the magnitude of seasonal fluctuations more accurately than the additive specification when fitting the historical data.
+
+```{r train-fit-table}
+train_fit_display <- hw_train_metrics
+names(train_fit_display)[names(train_fit_display) == "sMAPE"] <- "AMAPE"
+
+knitr::kable(
+  train_fit_display,
+  digits = 4,
+  caption = "Table 1. In-sample fit errors for additive and multiplicative Holt-Winters models"
+)
+```
+
+---
+
+### Forecast Error Evaluation
+
+Forecast performance was then evaluated using the **out-of-sample test dataset** consisting of the last 12 observations.
+
+The results are reported in **Table 2**, which compares forecast errors for all tested Holt-Winters specifications.
+
+In contrast to the in-sample fit results, the **additive Holt-Winters model with manually selected parameters** produced the **lowest forecast errors across all evaluated metrics**.
+
+This discrepancy between training and testing performance may be explained by the phenomenon of **model overfitting**. The multiplicative model with automatically optimized parameters was calibrated using the same observations on which its fit was evaluated, which may lead the model to capture noise specific to the training dataset rather than the true underlying data-generating process.
+
+As a result, although the multiplicative model achieved a better fit to the historical data, it performed worse when predicting new observations.
+
+This finding highlights an important principle in time-series forecasting: **models that achieve the best in-sample fit do not necessarily produce the most accurate forecasts**.
+
+For completeness, baseline benchmark models (Naive and Seasonal Naive) are also evaluated in the production script and written to [analysis_outputs/model_metrics.csv](analysis_outputs/model_metrics.csv).
+
+```{r test-forecast-table}
+test_fit_display <- hw_test_metrics
+names(test_fit_display)[names(test_fit_display) == "sMAPE"] <- "AMAPE"
+
+knitr::kable(
+  test_fit_display,
+  digits = 4,
+  caption = "Table 2. Out-of-sample forecast errors for additive and multiplicative Holt-Winters models"
+)
+```
+
+---
+
+### Forecast Comparison
+
+Figure 3 presents a visual comparison between the **forecasts generated by the additive and multiplicative Holt-Winters models** and the **actual observed values** of the variable representing the number of newly started residential construction projects.
+
+The comparison confirms the quantitative evaluation based on forecast error metrics. The additive model with manually selected parameters tracks the actual values more closely during the forecast horizon, while the multiplicative models exhibit larger deviations from realized observations.
+
+This graphical comparison supports the conclusion that the additive specification provides **more reliable short-term forecasts** for the analysed series.
+
+```{r forecast-comparison-plot, fig.height=5.8, fig.cap="Figure 3. Forecast comparison for additive and multiplicative Holt-Winters models against observed values."}
+ggplot2::ggplot(
+  hw_backtest_data,
+  ggplot2::aes(x = date, y = value, color = series, linetype = series)
+) +
+  ggplot2::geom_line(linewidth = 0.9) +
+  ggplot2::geom_vline(
+    xintercept = max(analysis_env$train_df$date),
+    color = "#9B2226",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  ggplot2::scale_color_manual(
+    values = c(
+      "Actual" = "#1B1F3B",
+      "HW Additive (Auto)" = "#005F73",
+      "HW Additive (Fixed)" = "#0A9396",
+      "HW Multiplicative (Auto)" = "#EE9B00",
+      "HW Multiplicative (Fixed)" = "#CA6702"
+    )
+  ) +
+  ggplot2::labs(
+    title = "Forecast comparison: additive vs multiplicative Holt-Winters",
+    subtitle = "Dashed line marks forecast origin (last historical observation)",
+    x = "Date",
+    y = "Construction starts (thousand units)",
+    color = "Series",
+    linetype = "Series"
+  ) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+```
+
+## 4. Residual Diagnostics (Train Window)
+
+Residual diagnostics are reported to flag potential remaining autocorrelation and bias.
+
+In this analysis, Ljung-Box p-values are generally low across specifications, indicating that residual autocorrelation is still present. This suggests that Holt-Winters captures a substantial share of trend-seasonal structure but does not fully absorb all serial dependence in the series.
+
+```{r diagnostics-table}
+knitr::kable(
+  diagnostics_table,
+  digits = 6,
+  caption = "Table 3. Residual diagnostics by model"
+)
+```
+
+## 5. 12-Month Forward Forecast (Champion Model)
+
+The table below reports point forecasts together with 80% and 95% prediction intervals, which quantify forecast uncertainty around the central projection path.
+
+```{r forecast-table}
+knitr::kable(
+  forward_forecast,
+  digits = 3,
+  caption = "Table 4. Champion model forward forecast with 80% and 95% intervals"
+)
+```
+
+## 6. Exported Artifacts
+
+```{r artifact-list}
+artifact_dir <- file.path("analysis_outputs")
+artifact_files <- if (dir.exists(artifact_dir)) list.files(artifact_dir) else character(0)
+
+knitr::kable(
+  data.frame(file = artifact_files),
+  caption = "Table 5. Files generated by the production script"
+)
+```
+
+## 7. Reproducibility Note
+
+The script writes session details to `analysis_outputs/session_info.txt`.
+This supports traceability of package versions and runtime environment for RPubs publication.
+
+## 8. Full Reproducible Code
+
+To preserve the same implementation detail as the standalone analysis script, the full production code is embedded below.
+
+```{r full-production-code, echo=FALSE, results='asis'}
+full_script_code <- readLines("construction_data_analysis.R", warn = FALSE)
+cat("```r\n")
+cat(paste(full_script_code, collapse = "\n"))
+cat("\n```")
+```

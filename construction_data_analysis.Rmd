@@ -31,7 +31,6 @@ knitr::opts_chunk$set(
 ```
 
 ```{r run-analysis}
-# Run the production script in an isolated environment and reuse all generated objects.
 analysis_env <- new.env(parent = globalenv())
 invisible(capture.output(sys.source("construction_data_analysis.R", envir = analysis_env)))
 
@@ -358,6 +357,7 @@ To preserve the same implementation detail as the standalone analysis script, th
 
 ```{r full-production-code, echo=FALSE, results='asis'}
 full_script_code <- readLines("construction_data_analysis.R", warn = FALSE)
+full_script_code <- full_script_code[!grepl("^\\s*#", full_script_code)]
 cat("```r\n")
 cat(paste(full_script_code, collapse = "\n"))
 cat("\n```")

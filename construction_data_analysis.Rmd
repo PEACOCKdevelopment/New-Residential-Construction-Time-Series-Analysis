@@ -15,7 +15,7 @@ output:
 
 ## 1. Executive Summary
 
-This report evaluates monthly residential construction starts using a compact and reproducible time-series workflow.
+This report evaluates monthly new residential construction starts using a compact and reproducible time-series workflow.
 The model comparison includes Holt-Winters variants and baseline methods (Naive and Seasonal Naive). Detailed backtest evidence and forecast-quality assessment are presented in the Forecast Error Evaluation and Forecast Comparison subsections.
 
 ## 2. Analysis Setup
